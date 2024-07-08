@@ -1,0 +1,130 @@
+version: "3.9"
+
+# wsl -d docker-desktop
+# sysctl -w vm.max_map_count=262144
+
+# To create elasticsearch certificate
+# docker-compose -f docker-compose.setup.yml run --rm keystore
+# docker-compose -f docker-compose.setup.yml run --rm certs
+
+secrets:
+  elasticsearch.keystore:
+    file: ./secrets/elasticsearch.keystore
+  elastic.certificates:
+    file: ./secrets/elastic-certificates.p12
+
+services:
+  web:
+    build: .
+    command: python manage.py runserver 0.0.0.0:8000
+    environment:
+      ELASTIC_USERNAME: ${ELASTIC_USERNAME}
+      ELASTIC_PASSWORD: ${ELASTIC_PASSWORD}
+      ELASTICSEARCH_HOST_PORT: ${ELASTICSEARCH_HOST}:${ELASTICSEARCH_PORT}
+    volumes:
+      - .:/wdtestdocker
+    ports:
+      - 8000:8000
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+
+  db:
+    image: postgres:15
+    ports:
+    - 5432:5432
+    volumes:
+      - postgres_data:/var/lib/postgresql/data/
+    environment:
+      - "POSTGRES_HOST_AUTH_METHOD=trust"
+
+  elasticsearch:
+    image: elasticsearch:${ELK_VERSION}
+    restart: always
+    environment:
+      ELASTIC_USERNAME: ${ELASTIC_USERNAME}
+      ELASTIC_PASSWORD: ${ELASTIC_PASSWORD}
+      ELASTIC_CLUSTER_NAME: ${ELASTIC_CLUSTER_NAME}
+      ELASTIC_NODE_NAME: ${ELASTIC_NODE_NAME}
+      ELASTIC_INIT_MASTER_NODE: ${ELASTIC_INIT_MASTER_NODE}
+      ELASTIC_DISCOVERY_SEEDS: ${ELASTIC_DISCOVERY_SEEDS}
+      ES_JAVA_OPTS: -Xmx${ELASTICSEARCH_HEAP} -Xms${ELASTICSEARCH_HEAP}
+      bootstrap.memory_lock: "true"
+    volumes:
+      - elasticsearch-data-volume:/usr/share/elasticsearch/data
+      - ./app/etc/elasticsearch/config/elasticsearch.yml:/usr/share/elasticsearch/config/elasticsearch.yml
+    secrets:
+      - source: elasticsearch.keystore
+        target: /usr/share/elasticsearch/config/elasticsearch.keystore
+      - source: elastic.certificates
+        target: /usr/share/elasticsearch/config/certs/elastic-certificates.p12
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 200000
+        hard: 200000
+    healthcheck:
+      test: curl -XGET localhost:9200 || exit 1
+      interval: 5s
+      timeout: 10s
+      retries: 50
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:${ELK_VERSION}
+    restart: unless-stopped
+    volumes:
+      - ./app/etc/kibana/config/:/usr/share/kibana/config/:ro
+    environment:
+      ELASTIC_USERNAME: ${ELASTIC_USERNAME}
+      ELASTIC_PASSWORD: ${ELASTIC_PASSWORD}
+      ELASTICSEARCH_HOST_PORT: ${ELASTICSEARCH_HOST}:${ELASTICSEARCH_PORT}
+    ports:
+      - 5601:5601
+    depends_on:
+      - elasticsearch
+    healthcheck:
+      test: ["CMD", "curl", "-f", "kibana:5601"]
+      interval: 5s
+      timeout: 10s
+      retries: 50
+
+  logstash:
+    image: logstash:${ELK_VERSION}
+    restart: unless-stopped
+    volumes:
+      - ./app/etc/logstash/pipeline/logstash.conf:/usr/share/logstash/pipeline/logstash.conf:ro
+      - ./app/etc/logstash/config/logstash.yml:/usr/share/logstash/config/logstash.yml:ro
+    environment:
+      ELASTIC_USERNAME: ${ELASTIC_USERNAME}
+      ELASTIC_PASSWORD: ${ELASTIC_PASSWORD}
+      ELASTICSEARCH_HOST_PORT: ${ELASTICSEARCH_HOST}:${ELASTICSEARCH_PORT}
+      LS_JAVA_OPTS: "-Xmx${LOGSTASH_HEAP} -Xms${LOGSTASH_HEAP}"
+    depends_on:   
+          kibana:
+            condition: service_healthy  
+  
+  filebeat:
+    image: docker.elastic.co/beats/filebeat:${ELK_VERSION}
+    user: root
+    restart: unless-stopped
+    volumes:
+      - ./app/etc/filebeat/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+      - type: bind
+        source: /var/lib/docker
+        target: /var/lib/docker
+    command: ["filebeat", "-e", "-strict.perms=false"]
+    depends_on:
+      kibana:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  elasticsearch-data-volume:
